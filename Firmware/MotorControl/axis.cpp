@@ -6,14 +6,16 @@
 #include "utils.h"
 #include "odrive_main.h"
 
-Axis::Axis(const AxisHardwareConfig_t& hw_config,
+Axis::Axis(int axis_num,
+           const AxisHardwareConfig_t& hw_config,
            Config_t& config,
            Encoder& encoder,
            SensorlessEstimator& sensorless_estimator,
            Controller& controller,
            Motor& motor,
            TrapezoidalTrajectory& trap)
-    : hw_config_(hw_config),
+    : axis_num_(axis_num),
+      hw_config_(hw_config),
       config_(config),
       encoder_(encoder),
       sensorless_estimator_(sensorless_estimator),
@@ -28,6 +30,35 @@ Axis::Axis(const AxisHardwareConfig_t& hw_config,
     trap_.axis_ = this;
 
     decode_step_dir_pins();
+    update_watchdog_settings();
+}
+
+Axis::LockinConfig_t Axis::default_calibration() {
+    Axis::LockinConfig_t config;
+    config.current = 10.0f;           // [A]
+    config.ramp_time = 0.4f;          // [s]
+    config.ramp_distance = 1 * M_PI;  // [rad]
+    config.accel = 20.0f;     // [rad/s^2]
+    config.vel = 40.0f; // [rad/s]
+    config.finish_distance = 100.0f * 2.0f * M_PI;  // [rad]
+    config.finish_on_vel = false;
+    config.finish_on_distance = true;
+    config.finish_on_enc_idx = true;
+    return config;
+}
+
+Axis::LockinConfig_t Axis::default_sensorless() {
+    Axis::LockinConfig_t config;
+    config.current = 10.0f;           // [A]
+    config.ramp_time = 0.4f;          // [s]
+    config.ramp_distance = 1 * M_PI;  // [rad]
+    config.accel = 200.0f;     // [rad/s^2]
+    config.vel = 400.0f; // [rad/s]
+    config.finish_distance = 100.0f;  // [rad]
+    config.finish_on_vel = true;
+    config.finish_on_distance = false;
+    config.finish_on_enc_idx = false;
+    return config;
 }
 
 static void step_cb_wrapper(void* ctx) {
@@ -88,6 +119,21 @@ void Axis::decode_step_dir_pins() {
     dir_pin_ = get_gpio_pin_by_pin(config_.dir_gpio_pin);
 }
 
+// @brief: Setup the watchdog reset value from the configuration watchdog timeout interval. 
+void Axis::update_watchdog_settings() {
+
+    if(config_.watchdog_timeout <= 0.0f) { // watchdog disabled 
+        watchdog_reset_value_ = 0;
+    } else if(config_.watchdog_timeout >= UINT32_MAX / (current_meas_hz+1)) { //overflow! 
+        watchdog_reset_value_ = UINT32_MAX;
+    } else {
+        watchdog_reset_value_ = static_cast<uint32_t>(config_.watchdog_timeout * current_meas_hz);
+    }
+
+    // Do a feed to avoid instant timeout
+    watchdog_feed();
+}
+
 // @brief (de)activates step/dir input
 void Axis::set_step_dir_active(bool active) {
     if (active) {
@@ -141,36 +187,86 @@ bool Axis::do_updates() {
     return check_for_errors();
 }
 
-bool Axis::run_sensorless_spin_up() {
-    // Early Spin-up: spiral up current
+// @brief Feed the watchdog to prevent watchdog timeouts.
+void Axis::watchdog_feed() {
+    watchdog_current_value_ = watchdog_reset_value_;
+}
+
+// @brief Check the watchdog timer for expiration. Also sets the watchdog error bit if expired. 
+bool Axis::watchdog_check() {
+    // reset value = 0 means watchdog disabled. 
+    if(watchdog_reset_value_ == 0) return true;
+
+    // explicit check here to ensure that we don't underflow back to UINT32_MAX
+    if(watchdog_current_value_ > 0) {
+        watchdog_current_value_--;
+        return true;
+    } else {
+        error_ |= ERROR_WATCHDOG_TIMER_EXPIRED;
+        return false;
+    }
+}
+
+bool Axis::run_lockin_spin(const LockinConfig_t &lockin_config) {
+    // Spiral up current for softer rotor lock-in
+    lockin_state_ = LOCKIN_STATE_RAMP;
     float x = 0.0f;
-    run_control_loop([&](){
-        float phase = wrap_pm_pi(config_.ramp_up_distance * x);
-        float I_mag = config_.spin_up_current * x;
-        x += current_meas_period / config_.ramp_up_time;
+    run_control_loop([&]() {
+        float phase = wrap_pm_pi(lockin_config.ramp_distance * x);
+        float I_mag = lockin_config.current * x;
+        x += current_meas_period / lockin_config.ramp_time;
         if (!motor_.update(I_mag, phase, 0.0f))
-            return error_ |= ERROR_MOTOR_FAILED, false;
+            return false;
         return x < 1.0f;
     });
-    if (error_ != ERROR_NONE)
-        return false;
     
-    // Late Spin-up: accelerate
-    float vel = config_.ramp_up_distance / config_.ramp_up_time;
-    float phase = wrap_pm_pi(config_.ramp_up_distance);
-    run_control_loop([&](){
-        vel += config_.spin_up_acceleration * current_meas_period;
+    // Spin states
+    float distance = lockin_config.ramp_distance;
+    float phase = wrap_pm_pi(distance);
+    float vel = distance / lockin_config.ramp_time;
+
+    // Function of states to check if we are done
+    auto spin_done = [&](bool vel_override = false) -> bool {
+        bool done = false;
+        if (lockin_config.finish_on_vel || vel_override)
+            done = done || fabsf(vel) >= fabsf(lockin_config.vel);
+        if (lockin_config.finish_on_distance)
+            done = done || fabsf(distance) >= fabsf(lockin_config.finish_distance);
+        if (lockin_config.finish_on_enc_idx)
+            done = done || encoder_.index_found_;
+        return done;
+    };
+
+    // Accelerate
+    lockin_state_ = LOCKIN_STATE_ACCELERATE;
+    run_control_loop([&]() {
+        vel += lockin_config.accel * current_meas_period;
+        distance += vel * current_meas_period;
         phase = wrap_pm_pi(phase + vel * current_meas_period);
-        float I_mag = config_.spin_up_current;
-        if (!motor_.update(I_mag, phase, vel))
-            return error_ |= ERROR_MOTOR_FAILED, false;
-        return vel < config_.spin_up_target_vel;
+
+        if (!motor_.update(lockin_config.current, phase, vel))
+            return false;
+        return !spin_done(true); //vel_override to go to next phase
     });
 
-    // call to controller.reset() that happend when arming means that vel_setpoint
-    // is zeroed. So we make the setpoint the spinup target for smooth transition.
-    controller_.vel_setpoint_ = config_.spin_up_target_vel;
+    if (!encoder_.index_found_)
+        encoder_.set_idx_subscribe(true);
 
+    // Constant speed
+    if (!spin_done()) {
+        lockin_state_ = LOCKIN_STATE_CONST_VEL;
+        vel = lockin_config.vel; // reset to actual specified vel to avoid small integration error
+        run_control_loop([&]() {
+            distance += vel * current_meas_period;
+            phase = wrap_pm_pi(phase + vel * current_meas_period);
+
+            if (!motor_.update(lockin_config.current, phase, vel))
+                return false;
+            return !spin_done();
+        });
+    }
+
+    lockin_state_ = LOCKIN_STATE_INACTIVE;
     return check_for_errors();
 }
 
@@ -270,44 +366,69 @@ void Axis::run_state_machine_loop() {
 
         // Note that current_state is a reference to task_chain_[0]
 
-        // Validate the state before running it
-        if (current_state_ > AXIS_STATE_MOTOR_CALIBRATION && !motor_.is_calibrated_)
-            current_state_ = AXIS_STATE_UNDEFINED;
-        if (current_state_ > AXIS_STATE_ENCODER_OFFSET_CALIBRATION && !encoder_.is_ready_)
-            current_state_ = AXIS_STATE_UNDEFINED;
-
         // Run the specified state
         // Handlers should exit if requested_state != AXIS_STATE_UNDEFINED
         bool status;
         switch (current_state_) {
-            case AXIS_STATE_MOTOR_CALIBRATION:
+            case AXIS_STATE_MOTOR_CALIBRATION: {
                 status = motor_.run_calibration();
-                break;
+            } break;
 
-            case AXIS_STATE_ENCODER_INDEX_SEARCH:
+            case AXIS_STATE_ENCODER_INDEX_SEARCH: {
+                if (!motor_.is_calibrated_)
+                    goto invalid_state_label;
+                if (encoder_.config_.idx_search_unidirectional && motor_.config_.direction==0)
+                    goto invalid_state_label;
+
                 status = encoder_.run_index_search();
-                break;
+            } break;
 
-            case AXIS_STATE_ENCODER_OFFSET_CALIBRATION:
+            case AXIS_STATE_ENCODER_DIR_FIND: {
+                if (!motor_.is_calibrated_)
+                    goto invalid_state_label;
+
+                status = encoder_.run_direction_find();
+            } break;
+
+            case AXIS_STATE_ENCODER_OFFSET_CALIBRATION: {
+                if (!motor_.is_calibrated_)
+                    goto invalid_state_label;
                 status = encoder_.run_offset_calibration();
-                break;
+            } break;
 
-            case AXIS_STATE_SENSORLESS_CONTROL:
-                status = run_sensorless_spin_up(); // TODO: restart if desired
-                if (status)
+            case AXIS_STATE_LOCKIN_SPIN: {
+                if (!motor_.is_calibrated_ || motor_.config_.direction==0)
+                    goto invalid_state_label;
+                status = run_lockin_spin(config_.lockin);
+            } break;
+
+            case AXIS_STATE_SENSORLESS_CONTROL: {
+                if (!motor_.is_calibrated_ || motor_.config_.direction==0)
+                        goto invalid_state_label;
+                status = run_lockin_spin(config_.sensorless_ramp); // TODO: restart if desired
+                if (status) {
+                    // call to controller.reset() that happend when arming means that vel_setpoint
+                    // is zeroed. So we make the setpoint the spinup target for smooth transition.
+                    controller_.vel_setpoint_ = config_.sensorless_ramp.vel;
                     status = run_sensorless_control_loop();
-                break;
+                }
+            } break;
 
-            case AXIS_STATE_CLOSED_LOOP_CONTROL:
+            case AXIS_STATE_CLOSED_LOOP_CONTROL: {
+                if (!motor_.is_calibrated_ || motor_.config_.direction==0)
+                    goto invalid_state_label;
+                if (!encoder_.is_ready_)
+                    goto invalid_state_label;
                 status = run_closed_loop_control_loop();
-                break;
+            } break;
 
-            case AXIS_STATE_IDLE:
+            case AXIS_STATE_IDLE: {
                 run_idle_loop();
                 status = motor_.arm(); // done with idling - try to arm the motor
-                break;
+            } break;
 
             default:
+            invalid_state_label:
                 error_ |= ERROR_INVALID_STATE;
                 status = false; // this will set the state to idle
                 break;
